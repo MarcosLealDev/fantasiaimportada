@@ -1,0 +1,6 @@
+# Filled in per environment; contains database credentials.
+import.env
+# Generated locally from the OpenCart dump (18 MB).
+bella-catalog.sql
+# Database dumps taken by ./run-import.sh backup
+backups/
