@@ -1,0 +1,83 @@
+services:
+  db:
+    image: mariadb:12.3
+    # The dump uses utf8mb4_unicode_520_ci throughout; pin it server-side.
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_520_ci
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: fantasia_wpdb
+      MARIADB_USER: fantasia
+      MARIADB_PASSWORD: fantasia
+    volumes:
+      - db_data:/var/lib/mysql
+      # Imported automatically the first time the db_data volume is empty.
+      - ./db-backup:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  wordpress:
+    image: wordpress:php8.3-apache
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:80"
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_NAME: fantasia_wpdb
+      WORDPRESS_DB_USER: fantasia
+      WORDPRESS_DB_PASSWORD: fantasia
+      WORDPRESS_TABLE_PREFIX: wp_
+      # Read by wp-config.php to switch off the production HTTPS/host settings.
+      WORDPRESS_LOCAL_DEV: "1"
+      WORDPRESS_HOME: "http://localhost:8000"
+      WORDPRESS_SITEURL: "http://localhost:8000"
+      WORDPRESS_DEBUG: "1"
+    volumes:
+      - ./wordpress:/var/www/html
+      - ./docker/mu-plugins/00-local-dev.php:/var/www/html/wp-content/mu-plugins/00-local-dev.php:ro
+      - ./tools/import-opencart/01-opencart-images.php:/var/www/html/wp-content/mu-plugins/01-opencart-images.php:ro
+      - ./docker/php-local.ini:/usr/local/etc/php/conf.d/zz-local.ini:ro
+      # OpenCart images are linked, never copied. Read-only so WordPress can
+      # never write into the Bella Collezione image store; generated thumbnails
+      # go to wp-content/uploads/oc-thumbs instead (see 01-opencart-images.php).
+      - /Users/marcosleal/devops/bella-image/catalog:/var/www/html/wp-content/uploads/oc-catalog:ro
+      - /Users/marcosleal/devops/bella-image/cache/catalog:/var/www/html/wp-content/uploads/oc-cache:ro
+      - ./tools/import-opencart:/import:ro
+    restart: unless-stopped
+
+  # One-shot helper: docker compose --profile tools run --rm wpcli <command>
+  wpcli:
+    image: wordpress:cli-php8.3
+    depends_on:
+      db:
+        condition: service_healthy
+    user: "33:33"
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_NAME: fantasia_wpdb
+      WORDPRESS_DB_USER: fantasia
+      WORDPRESS_DB_PASSWORD: fantasia
+      WORDPRESS_LOCAL_DEV: "1"
+      WORDPRESS_HOME: "http://localhost:8000"
+      WORDPRESS_SITEURL: "http://localhost:8000"
+      OC_DB_NAME: bella_oc
+    volumes:
+      - ./wordpress:/var/www/html
+      - ./docker/mu-plugins/00-local-dev.php:/var/www/html/wp-content/mu-plugins/00-local-dev.php:ro
+      - ./tools/import-opencart/01-opencart-images.php:/var/www/html/wp-content/mu-plugins/01-opencart-images.php:ro
+      - /Users/marcosleal/devops/bella-image/catalog:/var/www/html/wp-content/uploads/oc-catalog:ro
+      - /Users/marcosleal/devops/bella-image/cache/catalog:/var/www/html/wp-content/uploads/oc-cache:ro
+      - ./tools/import-opencart:/import:ro
+    working_dir: /var/www/html
+    profiles: ["tools"]
+
+volumes:
+  db_data:
