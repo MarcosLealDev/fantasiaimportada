@@ -7,10 +7,24 @@
  *   docker compose --profile tools run --rm wpcli eval-file /import/import.php brands
  *   docker compose --profile tools run --rm wpcli eval-file /import/import.php attributes
  *   docker compose --profile tools run --rm wpcli eval-file /import/import.php products [batch] [after_id]
+ *   docker compose --profile tools run --rm wpcli eval-file /import/import.php products-missing [batch]
  *
  * Every phase is idempotent: records are matched on the OpenCart id kept in
  * `_oc_product_id` / `_oc_category_id` / `_oc_manufacturer_id` meta, so a run can
  * be interrupted and restarted without creating duplicates.
+ *
+ * `products` walks oc_product sequentially from `after_id` (defaults to where
+ * the last run stopped, via the oc_import_last_product_id option) -- the
+ * normal way to do the first, full import. `products-missing` instead diffs
+ * every OpenCart product id against the ones already carrying `_oc_product_id`
+ * meta and imports only the gap, regardless of the sequential pointer -- the
+ * way to catch rows a previous run skipped (empty name, a transient save
+ * failure) or ones added to OpenCart since.
+ *
+ * OC_BATCH_DELAY (seconds, fractional allowed) pauses between batches in both
+ * phases. Set it in import.env when running against a live server, to avoid
+ * hammering its database or PHP pool during the migration; 0 (the default)
+ * disables the pause.
  *
  * Images are never copied. Attachments point at the read-only oc-catalog mount
  * via `_wp_attached_file`, and `_oc_rel_path` tells the companion mu-plugin
@@ -481,12 +495,25 @@ function oc_unique_sku( string $candidate, int $oc_product_id, int $product_id )
 	return 'OC-' . $oc_product_id;
 }
 
-function oc_phase_products( wpdb $oc, int $batch, int $after_id, int $max_batches = 0 ): void {
-	global $wpdb;
+/**
+ * Pause between batches. Configured via OC_BATCH_DELAY (seconds, fractional
+ * allowed, e.g. "1.5") -- useful to avoid overloading a live server's DB or
+ * PHP-FPM pool during a large migration. 0 or unset disables it.
+ */
+function oc_batch_pause(): void {
+	static $seconds = null;
+	if ( null === $seconds ) {
+		$seconds = max( 0.0, (float) ( getenv( 'OC_BATCH_DELAY' ) ?: 0 ) );
+	}
+	if ( $seconds > 0 ) {
+		usleep( (int) round( $seconds * 1000000 ) );
+	}
+}
 
+/** Category/brand/attribute/special lookups shared by every products batch. */
+function oc_products_context( wpdb $oc ): array {
 	$cat_terms   = oc_term_lookup( '_oc_category_id', 'product_cat' );
 	$brand_terms = taxonomy_exists( 'product_brand' ) ? oc_term_lookup( '_oc_manufacturer_id', 'product_brand' ) : array();
-	$product_map = oc_product_map();
 
 	// option_value_id -> attribute term, for variations.
 	$value_terms = array();
@@ -515,15 +542,209 @@ function oc_phase_products( wpdb $oc, int $batch, int $after_id, int $max_batche
 			$specials[ $pid ] = (float) $row->price;
 		}
 	}
+
 	oc_log( sprintf( 'products: %d categories, %d brands, %d attribute values, %d live specials', count( $cat_terms ), count( $brand_terms ), count( $value_terms ), count( $specials ) ) );
 
-	$total     = (int) $oc->get_var( 'SELECT COUNT(*) FROM oc_product' );
-	$done      = 0;
-	$created   = 0;
-	$skipped   = 0;
-	$variations_made = 0;
-	$batches   = 0;
-	$started   = microtime( true );
+	return array(
+		'cat_terms'   => $cat_terms,
+		'brand_terms' => $brand_terms,
+		'value_terms' => $value_terms,
+		'specials'    => $specials,
+	);
+}
+
+/**
+ * Import (create or update) one OpenCart product row into WooCommerce.
+ * Shared by the sequential `products` phase and the `products-missing`
+ * catch-up phase. $product_map is keyed by OpenCart product_id and updated
+ * in place so later rows in the same run see products just created.
+ */
+function oc_import_product_row( wpdb $oc, object $row, array $ctx, array &$product_map ): array {
+	$cat_terms   = $ctx['cat_terms'];
+	$brand_terms = $ctx['brand_terms'];
+	$value_terms = $ctx['value_terms'];
+	$specials    = $ctx['specials'];
+
+	$oc_id = (int) $row->product_id;
+
+	$name = oc_text( $row->name );
+	if ( '' === $name ) {
+		return array( 'created' => false, 'skipped' => true, 'variations' => 0 );
+	}
+
+	$option_rows = $oc->get_results(
+		$oc->prepare(
+			'SELECT product_option_id, option_id FROM oc_product_option WHERE product_id = %d',
+			$oc_id
+		)
+	);
+
+	$existing_id = $product_map[ $oc_id ] ?? 0;
+	$is_variable = ! empty( $option_rows );
+	$created     = false;
+
+	if ( $existing_id ) {
+		$product = wc_get_product( $existing_id );
+		if ( ! $product || ( $product->is_type( 'variable' ) !== $is_variable ) ) {
+			$product = $is_variable ? new WC_Product_Variable( $existing_id ) : new WC_Product_Simple( $existing_id );
+		}
+	} else {
+		$product = $is_variable ? new WC_Product_Variable() : new WC_Product_Simple();
+		$created = true;
+	}
+
+	$price = round( (float) $row->price, 2 );
+	$product->set_name( $name );
+	$product->set_description( oc_html( $row->description ) );
+	$product->set_short_description( oc_text( $row->meta_description ) );
+	$product->set_status( oc_target_status( (int) $row->status ) );
+	$product->set_catalog_visibility( 'visible' );
+	$product->set_regular_price( (string) $price );
+	$product->set_sale_price( isset( $specials[ $oc_id ] ) ? (string) round( $specials[ $oc_id ], 2 ) : '' );
+	$product->set_date_created( $row->date_added && '0000-00-00 00:00:00' !== $row->date_added ? $row->date_added : null );
+
+	$slug = oc_slug( $oc, 'product_id=' . $oc_id );
+	if ( '' !== $slug ) {
+		$product->set_slug( $slug );
+	}
+
+	// OpenCart holds weights in pounds (weight_class_id 5); the store is kg.
+	$weight = (float) $row->weight;
+	if ( 5 === (int) $row->weight_class_id ) {
+		$weight *= OC_LB_TO_KG;
+	}
+	$product->set_weight( $weight > 0 ? (string) round( $weight, 3 ) : '' );
+
+	$quantity = (int) $row->quantity;
+	$product->set_manage_stock( ! $is_variable );
+	if ( ! $is_variable ) {
+		$product->set_stock_quantity( $quantity );
+	}
+	$product->set_stock_status( $quantity > 0 ? 'instock' : 'outofstock' );
+
+	$product->set_category_ids(
+		array_values(
+			array_filter(
+				array_map(
+					static function ( $cat_id ) use ( $cat_terms ) {
+						return $cat_terms[ (int) $cat_id ] ?? null;
+					},
+					$oc->get_col( $oc->prepare( 'SELECT category_id FROM oc_product_to_category WHERE product_id = %d', $oc_id ) )
+				)
+			)
+		)
+	);
+
+	$tags = array();
+	foreach ( explode( ',', oc_text( $row->tag ) ) as $tag ) {
+		$tag = trim( $tag );
+		if ( '' !== $tag && mb_strlen( $tag ) <= 80 ) {
+			$tags[] = $tag;
+		}
+	}
+	if ( $tags ) {
+		$product->set_tag_ids( array() ); // replaced below by name
+	}
+
+	// Images: featured plus gallery, all linked from the read-only mount.
+	$thumb = oc_attachment_id( (string) $row->image, $name );
+	if ( $thumb ) {
+		$product->set_image_id( $thumb );
+	}
+	$gallery = array();
+	foreach (
+		$oc->get_results( $oc->prepare( 'SELECT image FROM oc_product_image WHERE product_id = %d ORDER BY sort_order, product_image_id', $oc_id ) ) as $img
+	) {
+		$id = oc_attachment_id( (string) $img->image, $name );
+		if ( $id && $id !== $thumb ) {
+			$gallery[] = $id;
+		}
+	}
+	$product->set_gallery_image_ids( array_values( array_unique( $gallery ) ) );
+
+	// Attributes (used for variations when the product has options).
+	$attributes   = array();
+	$option_terms = array();
+	foreach ( $option_rows as $option_row ) {
+		$taxonomy = null;
+		$slugs    = array();
+		foreach (
+			$oc->get_results(
+				$oc->prepare(
+					'SELECT product_option_value_id, option_value_id, price, price_prefix, quantity, sku
+					 FROM oc_product_option_value WHERE product_option_id = %d',
+					$option_row->product_option_id
+				)
+			) as $value_row
+		) {
+			$term = $value_terms[ (int) $value_row->option_value_id ] ?? null;
+			if ( ! $term ) {
+				continue;
+			}
+			$taxonomy               = $term['taxonomy'];
+			$slugs[ $term['slug'] ] = $term['term_id'];
+			$option_terms[ $taxonomy ][ $term['slug'] ] = $value_row;
+		}
+
+		if ( $taxonomy && $slugs ) {
+			$attribute = new WC_Product_Attribute();
+			$attribute->set_id( wc_attribute_taxonomy_id_by_name( $taxonomy ) );
+			$attribute->set_name( $taxonomy );
+			$attribute->set_options( array_values( $slugs ) );
+			$attribute->set_visible( true );
+			$attribute->set_variation( true );
+			$attributes[ $taxonomy ] = $attribute;
+		}
+	}
+	$product->set_attributes( $attributes );
+
+	$product_id = $product->save();
+	if ( ! $product_id ) {
+		return array( 'created' => false, 'skipped' => true, 'variations' => 0 );
+	}
+
+	$product_map[ $oc_id ] = $product_id;
+	update_post_meta( $product_id, '_oc_product_id', $oc_id );
+	update_post_meta( $product_id, '_oc_model', (string) $row->model );
+
+	$sku = oc_unique_sku( (string) $row->sku ?: (string) $row->model, $oc_id, $product_id );
+	try {
+		$product->set_sku( $sku );
+		$product->save();
+	} catch ( Exception $e ) {
+		// Duplicate SKU: fall back to the OpenCart id, which is unique.
+		$product->set_sku( 'OC-' . $oc_id );
+		$product->save();
+	}
+
+	if ( $tags ) {
+		wp_set_object_terms( $product_id, $tags, 'product_tag', false );
+	}
+
+	$brand = $brand_terms[ (int) $row->manufacturer_id ] ?? null;
+	if ( $brand ) {
+		wp_set_object_terms( $product_id, array( $brand ), 'product_brand', false );
+	}
+
+	$variations = 0;
+	if ( $attributes && $option_terms ) {
+		$variations = oc_sync_variations( $product_id, $price, $option_terms );
+	}
+
+	return array( 'created' => $created, 'skipped' => false, 'variations' => $variations );
+}
+
+function oc_phase_products( wpdb $oc, int $batch, int $after_id, int $max_batches = 0 ): void {
+	$ctx         = oc_products_context( $oc );
+	$product_map = oc_product_map();
+
+	$total            = (int) $oc->get_var( 'SELECT COUNT(*) FROM oc_product' );
+	$done             = 0;
+	$created          = 0;
+	$skipped          = 0;
+	$variations_made  = 0;
+	$batches          = 0;
+	$started          = microtime( true );
 
 	while ( true ) {
 		$rows = $oc->get_results(
@@ -546,173 +767,13 @@ function oc_phase_products( wpdb $oc, int $batch, int $after_id, int $max_batche
 		}
 
 		foreach ( $rows as $row ) {
-			$oc_id    = (int) $row->product_id;
-			$after_id = $oc_id;
+			$after_id = (int) $row->product_id;
 			$done++;
 
-			$name = oc_text( $row->name );
-			if ( '' === $name ) {
-				$skipped++;
-				continue;
-			}
-
-			$option_rows = $oc->get_results(
-				$oc->prepare(
-					'SELECT product_option_id, option_id FROM oc_product_option WHERE product_id = %d',
-					$oc_id
-				)
-			);
-
-			$existing_id = $product_map[ $oc_id ] ?? 0;
-			$is_variable = ! empty( $option_rows );
-
-			if ( $existing_id ) {
-				$product = wc_get_product( $existing_id );
-				if ( ! $product || ( $product->is_type( 'variable' ) !== $is_variable ) ) {
-					$product = $is_variable ? new WC_Product_Variable( $existing_id ) : new WC_Product_Simple( $existing_id );
-				}
-			} else {
-				$product = $is_variable ? new WC_Product_Variable() : new WC_Product_Simple();
-				$created++;
-			}
-
-			$price = round( (float) $row->price, 2 );
-			$product->set_name( $name );
-			$product->set_description( oc_html( $row->description ) );
-			$product->set_short_description( oc_text( $row->meta_description ) );
-			$product->set_status( oc_target_status( (int) $row->status ) );
-			$product->set_catalog_visibility( 'visible' );
-			$product->set_regular_price( (string) $price );
-			$product->set_sale_price( isset( $specials[ $oc_id ] ) ? (string) round( $specials[ $oc_id ], 2 ) : '' );
-			$product->set_date_created( $row->date_added && '0000-00-00 00:00:00' !== $row->date_added ? $row->date_added : null );
-
-			$slug = oc_slug( $oc, 'product_id=' . $oc_id );
-			if ( '' !== $slug ) {
-				$product->set_slug( $slug );
-			}
-
-			// OpenCart holds weights in pounds (weight_class_id 5); the store is kg.
-			$weight = (float) $row->weight;
-			if ( 5 === (int) $row->weight_class_id ) {
-				$weight *= OC_LB_TO_KG;
-			}
-			$product->set_weight( $weight > 0 ? (string) round( $weight, 3 ) : '' );
-
-			$quantity = (int) $row->quantity;
-			$product->set_manage_stock( ! $is_variable );
-			if ( ! $is_variable ) {
-				$product->set_stock_quantity( $quantity );
-			}
-			$product->set_stock_status( $quantity > 0 ? 'instock' : 'outofstock' );
-
-			$product->set_category_ids(
-				array_values(
-					array_filter(
-						array_map(
-							static function ( $cat_id ) use ( $cat_terms ) {
-								return $cat_terms[ (int) $cat_id ] ?? null;
-							},
-							$oc->get_col( $oc->prepare( 'SELECT category_id FROM oc_product_to_category WHERE product_id = %d', $oc_id ) )
-						)
-					)
-				)
-			);
-
-			$tags = array();
-			foreach ( explode( ',', oc_text( $row->tag ) ) as $tag ) {
-				$tag = trim( $tag );
-				if ( '' !== $tag && mb_strlen( $tag ) <= 80 ) {
-					$tags[] = $tag;
-				}
-			}
-			if ( $tags ) {
-				$product->set_tag_ids( array() ); // replaced below by name
-			}
-
-			// Images: featured plus gallery, all linked from the read-only mount.
-			$thumb = oc_attachment_id( (string) $row->image, $name );
-			if ( $thumb ) {
-				$product->set_image_id( $thumb );
-			}
-			$gallery = array();
-			foreach (
-				$oc->get_results( $oc->prepare( 'SELECT image FROM oc_product_image WHERE product_id = %d ORDER BY sort_order, product_image_id', $oc_id ) ) as $img
-			) {
-				$id = oc_attachment_id( (string) $img->image, $name );
-				if ( $id && $id !== $thumb ) {
-					$gallery[] = $id;
-				}
-			}
-			$product->set_gallery_image_ids( array_values( array_unique( $gallery ) ) );
-
-			// Attributes (used for variations when the product has options).
-			$attributes   = array();
-			$option_terms = array();
-			foreach ( $option_rows as $option_row ) {
-				$taxonomy = null;
-				$slugs    = array();
-				foreach (
-					$oc->get_results(
-						$oc->prepare(
-							'SELECT product_option_value_id, option_value_id, price, price_prefix, quantity, sku
-							 FROM oc_product_option_value WHERE product_option_id = %d',
-							$option_row->product_option_id
-						)
-					) as $value_row
-				) {
-					$term = $value_terms[ (int) $value_row->option_value_id ] ?? null;
-					if ( ! $term ) {
-						continue;
-					}
-					$taxonomy                 = $term['taxonomy'];
-					$slugs[ $term['slug'] ]   = $term['term_id'];
-					$option_terms[ $taxonomy ][ $term['slug'] ] = $value_row;
-				}
-
-				if ( $taxonomy && $slugs ) {
-					$attribute = new WC_Product_Attribute();
-					$attribute->set_id( wc_attribute_taxonomy_id_by_name( $taxonomy ) );
-					$attribute->set_name( $taxonomy );
-					$attribute->set_options( array_values( $slugs ) );
-					$attribute->set_visible( true );
-					$attribute->set_variation( true );
-					$attributes[ $taxonomy ] = $attribute;
-				}
-			}
-			$product->set_attributes( $attributes );
-
-			$product_id = $product->save();
-			if ( ! $product_id ) {
-				$skipped++;
-				continue;
-			}
-
-			$product_map[ $oc_id ] = $product_id;
-			update_post_meta( $product_id, '_oc_product_id', $oc_id );
-			update_post_meta( $product_id, '_oc_model', (string) $row->model );
-
-			$sku = oc_unique_sku( (string) $row->sku ?: (string) $row->model, $oc_id, $product_id );
-			try {
-				$product->set_sku( $sku );
-				$product->save();
-			} catch ( Exception $e ) {
-				// Duplicate SKU: fall back to the OpenCart id, which is unique.
-				$product->set_sku( 'OC-' . $oc_id );
-				$product->save();
-			}
-
-			if ( $tags ) {
-				wp_set_object_terms( $product_id, $tags, 'product_tag', false );
-			}
-
-			$brand = $brand_terms[ (int) $row->manufacturer_id ] ?? null;
-			if ( $brand ) {
-				wp_set_object_terms( $product_id, array( $brand ), 'product_brand', false );
-			}
-
-			if ( $attributes && $option_terms ) {
-				$variations_made += oc_sync_variations( $product_id, $price, $option_terms );
-			}
+			$result           = oc_import_product_row( $oc, $row, $ctx, $product_map );
+			$created         += $result['created'] ? 1 : 0;
+			$skipped         += $result['skipped'] ? 1 : 0;
+			$variations_made += $result['variations'];
 		}
 
 		update_option( 'oc_import_last_product_id', $after_id, false );
@@ -736,10 +797,99 @@ function oc_phase_products( wpdb $oc, int $batch, int $after_id, int $max_batche
 			oc_log( sprintf( 'stopping after %d batch(es); resume with: products %d %d', $batches, $batch, $after_id ) );
 			break;
 		}
+
+		// Fewer rows than requested means the table is exhausted -- skip the
+		// pause before the next (empty) fetch would tell us the same thing.
+		if ( count( $rows ) < $batch ) {
+			break;
+		}
+
+		oc_batch_pause();
 	}
 
 	wp_defer_term_counting( false );
 	oc_log( sprintf( 'products done: %d processed, %d created, %d variations, %d skipped', $done, $created, $variations_made, $skipped ) );
+}
+
+/**
+ * Import only the OpenCart products that have no matching WooCommerce
+ * product yet (no `_oc_product_id` post meta for that id). Unlike the
+ * sequential `products` phase this ignores the oc_import_last_product_id
+ * pointer entirely, so it also catches rows a previous run skipped (empty
+ * name, a failed save) rather than only ones past the last processed id.
+ */
+function oc_phase_products_missing( wpdb $oc, int $batch, int $max_batches = 0 ): void {
+	$ctx         = oc_products_context( $oc );
+	$product_map = oc_product_map();
+
+	$all_ids     = array_map( 'intval', $oc->get_col( 'SELECT product_id FROM oc_product ORDER BY product_id' ) );
+	$missing_ids = array_values( array_diff( $all_ids, array_keys( $product_map ) ) );
+
+	oc_log( sprintf( 'products-missing: %d of %d OpenCart products have no matching WooCommerce product', count( $missing_ids ), count( $all_ids ) ) );
+
+	if ( ! $missing_ids ) {
+		oc_log( 'products-missing done: nothing to do' );
+		return;
+	}
+
+	$chunks = array_chunk( $missing_ids, max( 1, $batch ) );
+
+	$done             = 0;
+	$created          = 0;
+	$skipped          = 0;
+	$variations_made  = 0;
+	$batches          = 0;
+	$started          = microtime( true );
+
+	foreach ( $chunks as $chunk ) {
+		$placeholders = implode( ',', array_fill( 0, count( $chunk ), '%d' ) );
+		$rows         = $oc->get_results(
+			$oc->prepare(
+				"SELECT p.*, pd.name, pd.description, pd.meta_description, pd.tag
+				 FROM oc_product p
+				 JOIN oc_product_description pd
+				   ON pd.product_id = p.product_id AND pd.language_id = %d
+				 WHERE p.product_id IN ($placeholders)
+				 ORDER BY p.product_id",
+				array_merge( array( OC_LANG ), $chunk )
+			)
+		);
+
+		foreach ( $rows as $row ) {
+			$done++;
+
+			$result           = oc_import_product_row( $oc, $row, $ctx, $product_map );
+			$created         += $result['created'] ? 1 : 0;
+			$skipped         += $result['skipped'] ? 1 : 0;
+			$variations_made += $result['variations'];
+		}
+
+		$batches++;
+		$rate = $done / max( 0.001, microtime( true ) - $started );
+		oc_log(
+			sprintf(
+				'  %d/%d missing products | %d new, %d skipped, %d variations | %.1f/s',
+				$done,
+				count( $missing_ids ),
+				$created,
+				$skipped,
+				$variations_made,
+				$rate
+			)
+		);
+
+		if ( $max_batches && $batches >= $max_batches ) {
+			oc_log( sprintf( 'stopping after %d batch(es); %d products still missing', $batches, count( $missing_ids ) - $done ) );
+			break;
+		}
+
+		if ( $batches < count( $chunks ) ) {
+			oc_batch_pause();
+		}
+	}
+
+	wp_defer_term_counting( false );
+	oc_log( sprintf( 'products-missing done: %d processed, %d created, %d variations, %d skipped', $done, $created, $variations_made, $skipped ) );
 }
 
 /**
@@ -835,6 +985,13 @@ switch ( $phase ) {
 			(int) ( $oc_argv[3] ?? 0 )
 		);
 		break;
+	case 'products-missing':
+		oc_phase_products_missing(
+			$oc,
+			(int) ( $oc_argv[1] ?? 100 ),
+			(int) ( $oc_argv[2] ?? 0 )
+		);
+		break;
 	default:
-		oc_abort( 'usage: <categories|brands|attributes|products> [batch] [after_id] [max_batches]' );
+		oc_abort( 'usage: <categories|brands|attributes|products|products-missing> [batch] [after_id|max_batches] [max_batches]' );
 }

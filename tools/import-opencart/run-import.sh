@@ -8,6 +8,7 @@
 #   ./run-import.sh backup           # mysqldump the WordPress database first
 #   ./run-import.sh import           # categories, brands, attributes, products
 #   ./run-import.sh products 100     # resume just the product phase
+#   ./run-import.sh products-missing # catch up products a previous run skipped
 #   ./run-import.sh finish           # recount terms, clear caches, flush permalinks
 #
 #   ./run-import.sh all              # backup + setup + preflight + import
@@ -29,8 +30,9 @@ OC_DB_PASSWORD="${OC_DB_PASSWORD:-}"
 OC_DB_HOST="${OC_DB_HOST:-}"
 OC_IMPORT_STATUS="${OC_IMPORT_STATUS:-draft}"   # draft | source | publish
 OC_BATCH="${OC_BATCH:-100}"
+OC_BATCH_DELAY="${OC_BATCH_DELAY:-0}"       # seconds to pause between batches
 BACKUP_DIR="${BACKUP_DIR:-$HERE/backups}"
-export OC_DB_NAME OC_DB_USER OC_DB_PASSWORD OC_DB_HOST OC_IMPORT_STATUS WP_PATH
+export OC_DB_NAME OC_DB_USER OC_DB_PASSWORD OC_DB_HOST OC_IMPORT_STATUS OC_BATCH_DELAY WP_PATH
 # -----------------------------------------------------------------------------
 
 die()  { printf '\nError: %s\n' "$*" >&2; exit 1; }
@@ -140,7 +142,7 @@ backup)
 	;;
 
 import)
-	info "Importing (status policy: $OC_IMPORT_STATUS)"
+	info "Importing (status policy: $OC_IMPORT_STATUS, batch delay: ${OC_BATCH_DELAY}s)"
 	run_php import.php categories
 	run_php import.php brands
 	run_php import.php attributes
@@ -148,7 +150,7 @@ import)
 	run_php finish.php
 	;;
 
-categories|brands|attributes|products)
+categories|brands|attributes|products|products-missing)
 	run_php import.php "$@"
 	;;
 
