@@ -1,0 +1,52 @@
+# macOS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# --- WordPress core & vendored plugins/themes -------------------------------
+# Downloaded by the wordpress:php8.3-apache image / installed manually, not
+# tracked here. Reinstall plugins/themes from their own sources, not git.
+wordpress/wp-admin/
+wordpress/wp-includes/
+wordpress/wp-*.php
+wordpress/index.php
+wordpress/xmlrpc.php
+wordpress/license.txt
+wordpress/readme.html
+wordpress/wp-config-sample.php
+# phpinfo() dump left in the webroot -- leaks server config if left tracked/served.
+wordpress/info.php
+
+wordpress/wp-content/plugins/
+wordpress/wp-content/themes/
+wordpress/wp-content/languages/
+wordpress/wp-content/upgrade/
+wordpress/wp-content/upgrade-temp-backup/
+wordpress/wp-content/index.php
+wordpress/wp-content/debug.log
+wordpress/wp-content/jetpack-waf/
+wordpress/wp-content/rsssl-managed-htaccess.lock
+
+# mu-plugins here are empty Docker bind-mount placeholders; the real source is
+# docker/mu-plugins/ and tools/import-opencart/01-opencart-images.php.
+wordpress/wp-content/mu-plugins/
+
+# User media (real product/customer content) and generated thumbnail cache.
+wordpress/wp-content/uploads/
+
+# --- Secrets ------------------------------------------------------------
+# wp-config.php carries the live DB password and WordPress auth salts in
+# plaintext (see CLAUDE.md). This repo is public: never commit either file.
+wordpress/wp-config.php
+wp-config.php.prod.bak
+
+# --- Database dumps / PII -------------------------------------------------
+# Real customer and order data. Keep dumps local only.
+db-backup/*.sql
+tools/import-opencart/bella-catalog.sql
+tools/import-opencart/backups/
+tools/import-opencart/import.env
+
+# Docker volumes if ever created alongside the compose file
+db_data/

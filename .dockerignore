@@ -1,0 +1,23 @@
+# No service in docker-compose.yml currently builds a custom image (all use
+# prebuilt mariadb / wordpress images), so this has no effect yet. Kept ready
+# for if a Dockerfile is added later, mirroring .gitignore's exclusions.
+
+.git/
+.gitignore
+.dockerignore
+CLAUDE.md
+*.md
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+wordpress/wp-content/uploads/
+db-backup/*.sql
+tools/import-opencart/bella-catalog.sql
+tools/import-opencart/backups/
+tools/import-opencart/import.env
+
+wordpress/wp-config.php
+wp-config.php.prod.bak
