@@ -49,6 +49,25 @@ Every phase is idempotent — records are matched on `_oc_product_id`,
 updates instead of duplicating. Progress is stored in the `oc_import_last_product_id`
 option, which is why a bare `products` call resumes.
 
+**`products-missing`** is a separate catch-up phase: it diffs every OpenCart
+product id against the ones already carrying `_oc_product_id` meta and imports
+only the gap, ignoring the sequential pointer entirely. Run it after the main
+import to pick up anything a previous run skipped (an empty name, a transient
+save failure) or that was added to OpenCart afterwards:
+
+```sh
+$R products-missing 100
+```
+
+**`OC_BATCH_DELAY`** (seconds, fractional allowed, e.g. `1.5`) pauses between
+batches in both `products` and `products-missing`. It defaults to `0`
+(no pause); set it via `import.env` or the environment when running against a
+live server, to avoid loading its database or PHP pool during the migration:
+
+```sh
+docker compose --profile tools run --rm -e OC_BATCH_DELAY=2 wpcli eval-file /import/import.php products 100
+```
+
 ## Running it on the live server
 
 Both databases and the OpenCart images are already on the server, so the dump
@@ -86,10 +105,15 @@ OpenCart's own statuses without duplicating anything.
 The import is resumable: progress is saved to the `oc_import_last_product_id`
 option after every batch, so a dropped SSH session costs at most one batch. A
 bare `./run-import.sh products` continues from there; pass an explicit `0` to
-start over.
+start over. Run `./run-import.sh products-missing` afterwards as a safety net --
+it finds any OpenCart product with no matching WooCommerce product yet
+(regardless of where the sequential pointer stopped) and imports just those.
 
 Expect roughly 20 products/second -- about 7 minutes for a 7,700-product
-catalog, plus whatever the server's disk is doing.
+catalog, plus whatever the server's disk is doing. **Set `OC_BATCH_DELAY` in
+`import.env`** (seconds, fractional allowed) to pause between batches instead --
+useful on a live server so the migration doesn't compete with real traffic for
+the database or PHP pool. It applies to both `products` and `products-missing`.
 
 ### What touches the live site
 
