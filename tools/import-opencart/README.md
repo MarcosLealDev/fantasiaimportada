@@ -17,6 +17,13 @@ options, images) into the local WooCommerce store.
 requested size against OpenCart's cache first, then renders anything missing into
 `wp-content/uploads/oc-thumbs/` (disposable — delete it and it regenerates).
 
+**Nothing is ever cropped.** The catalog is mixed-shape — most images aren't
+square — so every size is rendered to fit within its box, preserving aspect
+ratio; the theme letterboxes the rest with CSS (`object-fit: contain` on
+product cards). `configure-images.php` sets the WooCommerce/Blocksy options
+this depends on — see [Mapping notes](#mapping-notes) for why two separate
+option pairs both need to be right.
+
 ## Running it locally (Docker)
 
 ```sh
@@ -68,6 +75,12 @@ live server, to avoid loading its database or PHP pool during the migration:
 docker compose --profile tools run --rm -e OC_BATCH_DELAY=2 wpcli eval-file /import/import.php products 100
 ```
 
+Once products are in, apply the letterboxed image sizes (idempotent, safe to re-run):
+
+```sh
+docker compose --profile tools run --rm wpcli eval-file /import/configure-images.php
+```
+
 ## Running it on the live server
 
 Both databases and the OpenCart images are already on the server, so the dump
@@ -80,7 +93,7 @@ cp import.env.example import.env      # fill in WP_PATH, OC_IMAGE_CATALOG, OC_DB
 ./run-import.sh backup                # mysqldump the WordPress database
 ./run-import.sh setup                 # symlink images, install the mu-plugin
 ./run-import.sh preflight             # re-check now that the symlink exists
-./run-import.sh import                # categories, brands, attributes, products, finish
+./run-import.sh import                # categories, brands, attributes, products, images, finish
 ```
 
 `./run-import.sh all` chains backup, setup, preflight and import in that order.
@@ -150,3 +163,11 @@ Restoring the `backup` dump is the blunter option.
   attribute each (`pa_tamanho` and friends); everything else stays simple.
 - Only specials whose date window covers today become sale prices.
 - OpenCart `status` maps to publish/draft.
+- **Image cropping is controlled by two separate option pairs, and both must
+  agree.** `woocommerce_{key}_cropping` controls the file WordPress
+  *generates*; `woocommerce_{key}_cropping_custom_width/height` control the
+  *CSS box* Blocksy draws around it (`blocksy_get_woocommerce_ratio()` reads
+  the custom width/height options directly, not `_cropping`). Setting only
+  one half still leaves a crop in place. `configure-images.php` sets both, for
+  both `woocommerce_archive_thumbnail` (product cards) and `woocommerce_thumbnail`
+  (cart, related products, blocks).

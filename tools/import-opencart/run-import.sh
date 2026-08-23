@@ -6,9 +6,10 @@
 #   ./run-import.sh preflight        # read-only checks, changes nothing
 #   ./run-import.sh setup            # symlink images + install the mu-plugin
 #   ./run-import.sh backup           # mysqldump the WordPress database first
-#   ./run-import.sh import           # categories, brands, attributes, products
+#   ./run-import.sh import           # categories, brands, attributes, products, images, finish
 #   ./run-import.sh products 100     # resume just the product phase
 #   ./run-import.sh products-missing # catch up products a previous run skipped
+#   ./run-import.sh images           # apply letterboxed (not cropped) image sizes
 #   ./run-import.sh finish           # recount terms, clear caches, flush permalinks
 #
 #   ./run-import.sh all              # backup + setup + preflight + import
@@ -147,11 +148,17 @@ import)
 	run_php import.php brands
 	run_php import.php attributes
 	run_php import.php products "$OC_BATCH"
+	run_php configure-images.php
 	run_php finish.php
 	;;
 
 categories|brands|attributes|products|products-missing)
 	run_php import.php "$@"
+	;;
+
+images)
+	info "Configuring image sizes and clearing stale thumbnails"
+	run_php configure-images.php
 	;;
 
 finish)

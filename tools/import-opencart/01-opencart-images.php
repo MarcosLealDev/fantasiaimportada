@@ -36,59 +36,109 @@ function oc_img_rel_path( int $attachment_id ): string {
 	return is_string( $rel ) ? ltrim( $rel, '/' ) : '';
 }
 
-/** Target dimensions + crop flag for a registered size name. */
+/** Target dimensions for a registered size name. Crop is intentionally ignored -- see oc_img_resolve(). */
 function oc_img_size_spec( $size ): ?array {
 	if ( is_array( $size ) ) {
-		return array( (int) $size[0], (int) $size[1], false );
+		return array( (int) $size[0], (int) $size[1] );
 	}
 
 	$additional = wp_get_additional_image_sizes();
 	if ( isset( $additional[ $size ] ) ) {
-		return array(
-			(int) $additional[ $size ]['width'],
-			(int) $additional[ $size ]['height'],
-			(bool) $additional[ $size ]['crop'],
-		);
+		return array( (int) $additional[ $size ]['width'], (int) $additional[ $size ]['height'] );
 	}
 
 	if ( in_array( $size, array( 'thumbnail', 'medium', 'medium_large', 'large' ), true ) ) {
-		return array(
-			(int) get_option( $size . '_size_w' ),
-			(int) get_option( $size . '_size_h' ),
-			(bool) get_option( $size . '_crop' ),
-		);
+		return array( (int) get_option( $size . '_size_w' ), (int) get_option( $size . '_size_h' ) );
 	}
 
 	return null;
 }
 
 /**
- * Resolve a requested size to a real file, generating it if need be.
- * Returns array( url, width, height ) or null to fall back to the original.
+ * OpenCart's cache renditions are always square (it pads to a square with
+ * white space rather than cropping -- confirmed by sampling pixels), so any
+ * rendition for this image is visually interchangeable with any other. Pick
+ * the smallest one at least as wide as requested, or the largest available
+ * if none is big enough, and return its real path/width/height.
  */
-function oc_img_resolve( string $rel, int $w, int $h, bool $crop ): ?array {
+function oc_img_cache_hit( string $rel, int $w ): ?array {
 	$dirs = oc_img_uploads();
 	$ext  = pathinfo( $rel, PATHINFO_EXTENSION );
 	$stem = substr( $rel, 0, - ( strlen( $ext ) + 1 ) );
 
-	// 1. OpenCart's own cache, which uses "-WxH" and "-WxHh" suffixes. It only
-	//    covers a small slice of the catalog, so treat a hit as a bonus.
-	foreach ( array( "-{$w}x{$h}h", "-{$w}x{$h}" ) as $suffix ) {
-		$candidate = OC_IMG_CACHE . '/' . $stem . $suffix . '.' . $ext;
-		if ( is_readable( $dirs['basedir'] . '/' . $candidate ) ) {
-			return array( $dirs['baseurl'] . '/' . $candidate, $w, $h );
+	$dir   = $dirs['basedir'] . '/' . OC_IMG_CACHE . '/' . dirname( $stem );
+	$base  = basename( $stem );
+	// Slugs from the importer don't contain glob metacharacters (* ? [ ]), so a
+	// plain match is safe here.
+	$files = glob( $dir . '/' . $base . '-*.' . $ext, GLOB_NOSORT ) ?: array();
+
+	$candidates = array();
+	foreach ( $files as $file ) {
+		if ( preg_match( '/-(\d+)x(\d+)[a-z]?\.' . preg_quote( $ext, '/' ) . '$/i', $file, $m ) ) {
+			$candidates[ (int) $m[1] ] = $file;
 		}
 	}
+	if ( ! $candidates ) {
+		return null;
+	}
 
-	// 2. Something we rendered on an earlier request.
-	$mine = OC_IMG_THUMBS . '/' . $stem . "-{$w}x{$h}" . ( $crop ? 'c' : '' ) . '.' . $ext;
+	ksort( $candidates );
+	$chosen = null;
+	foreach ( $candidates as $width => $path ) {
+		if ( $width >= $w ) {
+			$chosen = $path;
+			break;
+		}
+	}
+	if ( null === $chosen ) {
+		// Largest available is still smaller than requested -- only worth using
+		// if it won't need blowing up too far (a cart-icon-sized 40px cache hit
+		// serving a 500px grid slot would be worse than just rendering fresh).
+		end( $candidates );
+		$largest_w = key( $candidates );
+		if ( $largest_w * 2 >= $w ) {
+			$chosen = current( $candidates );
+		}
+	}
+	if ( null === $chosen ) {
+		return null;
+	}
+
+	$actual = @getimagesize( $chosen );
+	if ( ! $actual ) {
+		return null;
+	}
+
+	$rel_url = ltrim( substr( $chosen, strlen( $dirs['basedir'] ) ), '/' );
+	return array( $dirs['baseurl'] . '/' . $rel_url, (int) $actual[0], (int) $actual[1] );
+}
+
+/**
+ * Resolve a requested size to a real file, generating it if need be.
+ * Never crops -- always fits within the box, preserving aspect ratio, so a
+ * mixed-shape catalog (most of it is not square) is never cut. The theme is
+ * responsible for the visual letterbox (see the wp_head style below).
+ * Returns array( url, width, height ) or null to fall back to the original.
+ */
+function oc_img_resolve( string $rel, int $w, int $h ): ?array {
+	$hit = oc_img_cache_hit( $rel, $w );
+	if ( null !== $hit ) {
+		return $hit;
+	}
+
+	$dirs = oc_img_uploads();
+	$ext  = pathinfo( $rel, PATHINFO_EXTENSION );
+	$stem = substr( $rel, 0, - ( strlen( $ext ) + 1 ) );
+
+	// Something we rendered on an earlier request.
+	$mine = OC_IMG_THUMBS . '/' . $stem . "-{$w}x{$h}." . $ext;
 	$path = $dirs['basedir'] . '/' . $mine;
 	if ( is_readable( $path ) ) {
 		$actual = @getimagesize( $path );
 		return array( $dirs['baseurl'] . '/' . $mine, $actual ? $actual[0] : $w, $actual ? $actual[1] : $h );
 	}
 
-	// 3. Render it once, into oc-thumbs and nowhere else.
+	// Render it once, into oc-thumbs and nowhere else.
 	$source = $dirs['basedir'] . '/' . OC_IMG_ORIGINALS . '/' . $rel;
 	if ( ! is_readable( $source ) ) {
 		return null;
@@ -104,7 +154,7 @@ function oc_img_resolve( string $rel, int $w, int $h, bool $crop ): ?array {
 		return null;
 	}
 
-	$editor->resize( $w, $h, $crop );
+	$editor->resize( $w, $h, false ); // never crop
 	if ( ! wp_mkdir_p( dirname( $path ) ) ) {
 		return null;
 	}
@@ -140,17 +190,22 @@ add_filter(
 			return $full;
 		}
 
-		list( $w, $h, $crop ) = $spec;
+		list( $w, $h ) = $spec;
 		if ( $w < 1 && $h < 1 ) {
 			return $full;
 		}
 
-		// Never upscale: an original smaller than the request is served as-is.
-		if ( $full_w && $full_h && $w >= $full_w && $h >= $full_h ) {
-			return $full;
+		// Never upscale. A dimension of 0 means "unconstrained" (proportional
+		// scaling by the other axis), so it always counts as already satisfied.
+		if ( $full_w && $full_h ) {
+			$width_fits  = ( $w < 1 ) || ( $full_w <= $w );
+			$height_fits = ( $h < 1 ) || ( $full_h <= $h );
+			if ( $width_fits && $height_fits ) {
+				return $full;
+			}
 		}
 
-		$resolved = oc_img_resolve( $rel, $w, $h, $crop );
+		$resolved = oc_img_resolve( $rel, $w, $h );
 		if ( null === $resolved ) {
 			return $full;
 		}
@@ -170,4 +225,14 @@ add_filter(
 	},
 	10,
 	5
+);
+
+// The image files are never cropped (see oc_img_resolve()); this is what turns
+// that into a uniform, letterboxed grid instead of stretched/odd-shaped cards.
+// Scoped to WooCommerce product loops, so it doesn't affect images elsewhere.
+add_action(
+	'wp_head',
+	static function () {
+		echo '<style>ul.products li.product .ct-media-container{--theme-object-fit:contain;}</style>' . "\n";
+	}
 );
