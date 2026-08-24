@@ -101,9 +101,21 @@ setup)
 		echo "linked oc-cache -> $OC_IMAGE_CACHE"
 	fi
 
-	mkdir -p "$UPLOADS/oc-thumbs"
-	chmod 775 "$UPLOADS/oc-thumbs"
-	echo "oc-thumbs ready (generated sizes live here, safe to delete anytime)"
+	mkdir -p "$UPLOADS/oc-thumbs" 2>/dev/null || true
+	if chmod 775 "$UPLOADS/oc-thumbs" 2>/dev/null; then
+		echo "oc-thumbs ready (generated sizes live here, safe to delete anytime)"
+	else
+		# Only the owner (or root) can chmod a directory. A failure here almost
+		# always means oc-thumbs already exists, owned by the web server's own
+		# user (e.g. www-data) -- expected once the site has been live for a
+		# while and has already been writing thumbnails into it. That's fine as
+		# long as the web server user can still write there; it just isn't
+		# something this script, running as a different user, can verify or
+		# change. Not fatal: the mu-plugin install below is what actually
+		# matters when re-running setup after an update.
+		echo "note: couldn't chmod oc-thumbs -- leaving its existing ownership/permissions alone:"
+		ls -ld "$UPLOADS/oc-thumbs" 2>/dev/null || true
+	fi
 
 	MU="$WP_PATH/wp-content/mu-plugins"
 	mkdir -p "$MU"
