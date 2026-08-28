@@ -35,6 +35,16 @@ wordpress/wp-content/mu-plugins/
 # User media (real product/customer content) and generated thumbnail cache.
 wordpress/wp-content/uploads/
 
+# --- Production environment ----------------------------------------------
+# Carries the database password in plain text. Lives only on the droplet,
+# created from .env.production.example.
+.env
+.env.production
+
+# Droplet-local: gzipped container logs the deploy archives before each
+# recreate (35-day retention). Never part of a checkout.
+logs/
+
 # --- Secrets ------------------------------------------------------------
 # wp-config.php carries the live DB password and WordPress auth salts in
 # plaintext (see CLAUDE.md). This repo is public: never commit either file.
@@ -44,6 +54,12 @@ wp-config.php.prod.bak
 # --- Database dumps / PII -------------------------------------------------
 # Real customer and order data. Keep dumps local only.
 db-backup/*.sql
+# Compressed dumps too. These were untracked but NOT ignored, which is a
+# different thing: 20260823_fantasiaDB.tgz is a 74 MB dump of the live database.
+# One `git add -A` would have committed it to a repo that has been public.
+db-backup/*.tgz
+db-backup/*.gz
+tools/*.tgz
 tools/import-opencart/bella-catalog.sql
 tools/import-opencart/backups/
 tools/import-opencart/import.env

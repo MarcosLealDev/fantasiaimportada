@@ -1,0 +1,283 @@
+name: Deploy to production
+
+# Merges to main deploy straight to fantasiaimportada.com.
+#
+# MERGING IS DEPLOYING. That is worth stating because the sibling repo learned
+# it the expensive way: a change that referenced something not yet present on
+# the droplet was merged "to be sequenced later", the deploy applied it
+# immediately, and two unrelated live stores went down. If a change here depends
+# on droplet state that does not exist yet, it does not belong on main yet.
+#
+# This site is a tenant on the bellacollezione droplet. It shares that host's
+# MariaDB and Caddy; this workflow only ever touches THIS site's code and its
+# own container. Two things it deliberately does not do:
+#
+#   - It never touches the Caddyfile. TLS, the apex -> www redirect and the
+#     (edge_hardening_wp) rules for this domain live in the bellacollezione2
+#     repo. Edge changes are PRs there, and that repo's deploy recreates Caddy.
+#   - It never runs docker compose for the shared services. If `opencart-network`
+#     is missing the bella stack is down, and this deploy fails loudly rather
+#     than create a network it does not own.
+#
+# Rollback is fix-forward: revert on main and let it redeploy.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: fantasia-production-deploy
+  cancel-in-progress: false
+
+env:
+  DEPLOY_USER: deploy
+  DEPLOY_PATH: /opt/fantasiaimportada
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/deploy_key
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+
+      - name: Rsync code to droplet
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          # WHAT THIS ACTUALLY SHIPS IS INFRASTRUCTURE, NOT WORDPRESS. Exactly
+          # one file under wordpress/ is tracked (.htaccess); core, wp-content
+          # and wp-config.php are droplet-owned state, seeded once from the old
+          # host. The excludes below are therefore mostly documentation of
+          # ownership rather than filters that fire -- gitignored paths are
+          # absent from this checkout anyway. They matter the day someone
+          # commits one by accident.
+          #
+          # No --delete, for the same reason: a blanket mirror would wipe the
+          # entire WordPress installation. Deletions are applied explicitly from
+          # the git diff in the next step.
+          rsync -avz --rsync-path="sudo rsync" \
+            -e "ssh -o UserKnownHostsFile=$HOME/.ssh/known_hosts" \
+            --exclude '.git' --exclude '.env*' \
+            --exclude 'wordpress/wp-config.php' \
+            --exclude 'wordpress/wp-admin/' --exclude 'wordpress/wp-includes/' \
+            --exclude 'wordpress/wp-content/plugins/' \
+            --exclude 'wordpress/wp-content/themes/' \
+            --exclude 'wordpress/wp-content/languages/' \
+            --exclude 'wordpress/wp-content/uploads/' \
+            --exclude 'wordpress/wp-content/upgrade/' \
+            --exclude 'wordpress/wp-content/upgrade-temp-backup/' \
+            --exclude 'db-backup/' --exclude 'wp-config.php.prod.bak' \
+            --exclude 'tools/import-opencart/backups/' \
+            --exclude 'tools/import-opencart/import.env' \
+            --exclude '*.sql' --exclude '*.tgz' \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
+
+      - name: Remove files deleted from git
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            echo "No previous commit to diff against (first push on this ref) - skipping."
+            exit 0
+          fi
+
+          git diff --diff-filter=D --name-only "$before" "${{ github.sha }}" > /tmp/deleted_files.txt
+          if [ ! -s /tmp/deleted_files.txt ]; then
+            echo "No files deleted in this push."
+            exit 0
+          fi
+
+          echo "Files deleted from git in this push:"
+          cat /tmp/deleted_files.txt
+
+          # NUL-delimited so filenames with spaces or newlines cannot break xargs.
+          sed 's/.*/&\x00/' /tmp/deleted_files.txt | \
+            ssh "$DEPLOY_USER@$DEPLOY_HOST" "cd $DEPLOY_PATH && xargs -0 -I{} sudo rm -f -- {}"
+
+      - name: Archive the access log before recreate
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          # `up -d --build` can change the image ID and force a recreate, and a
+          # recreated container starts with an empty json-file log. Snapshot it
+          # first, into a droplet-local directory the rsync never touches.
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -euo pipefail
+            cd '"$DEPLOY_PATH"'
+
+            sudo mkdir -p logs/access-archive
+
+            if docker inspect fi-wordpress >/dev/null 2>&1; then
+              docker logs fi-wordpress 2>/dev/null \
+                | gzip \
+                | sudo tee "logs/access-archive/$(date -u +%Y%m%dT%H%M%SZ).log.gz" >/dev/null
+            else
+              echo "No existing fi-wordpress container -- nothing to archive."
+            fi
+
+            sudo find logs/access-archive -name "*.log.gz" -mtime +35 -delete
+          ' < /dev/null
+
+      - name: Fix ownership and rebuild
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -euo pipefail
+            cd '"$DEPLOY_PATH"'
+
+            # rsync -a as a non-root user stamps files with the LOCAL uid, which
+            # www-data cannot then write to. For WordPress that surfaces as
+            # plugin updates and media uploads failing from the admin, with a
+            # permissions message that names the wrong cause.
+            sudo chown -R www-data:www-data wordpress
+
+            # Fails loudly if the bella stack (which owns this network) is down,
+            # rather than letting compose create a fresh, empty network that
+            # resolves neither mysql nor anything else.
+            docker network inspect opencart-network >/dev/null
+
+            docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build < /dev/null
+
+            # Guard against the service-name collision that took bellacollezione
+            # to 404s the first time a second stack came up on this network.
+            # Compose publishes each service NAME as a network alias
+            # (container_name does not), so a name shared with a neighbour
+            # resolves to TWO containers and Docker round-robins between them --
+            # cross-wiring two live sites with nothing reporting an error.
+            #
+            # Checked from inside Caddy, which is the resolver that actually
+            # matters, and after `up` so it sees the real running state.
+            for name in apache php frizza-apache frizza-php fi-wordpress wordpress; do
+              n=$(docker exec opencart-caddy getent hosts "$name" 2>/dev/null | wc -l)
+              if [ "$n" -gt 1 ]; then
+                echo "FATAL: \"$name\" resolves to $n containers on opencart-network." >&2
+                echo "The stacks are now cross-wired. Check service names in docker-compose.prod.yml." >&2
+                exit 1
+              fi
+            done
+            echo "Service-name isolation verified: no shared alias resolves to more than one container."
+
+            # The read-only mounts are what stop this site writing into the
+            # neighbouring store s 2.1 GB image tree. Assert it rather than trust
+            # it: a dropped :ro in a future edit would be silent until something
+            # had already written there.
+            for m in oc-catalog oc-cache; do
+              mode=$(docker inspect -f "{{range .Mounts}}{{if eq .Destination \"/var/www/html/wp-content/uploads/$m\"}}{{.RW}}{{end}}{{end}}" fi-wordpress)
+              if [ "$mode" != "false" ]; then
+                echo "FATAL: $m is mounted WRITABLE (RW=$mode); it must be read-only." >&2
+                exit 1
+              fi
+            done
+            echo "Image-store mounts verified read-only."
+
+            echo "___DEPLOY_STEPS_COMPLETE___"
+          ' < /dev/null
+
+      - name: Verify deploy
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          # VERIFIED FROM THE DROPLET, AGAINST THE ORIGIN -- never from this
+          # runner over the public hostname. Cloudflare 403s datacenter IPs
+          # running curl, and even when it does not, a cached 200 would report a
+          # healthy deploy over a broken origin.
+          #
+          # TWO PHASES, because this site is reachable through Caddy only after
+          # the edge PR in the bellacollezione2 repo has merged AND the DNS has
+          # been flipped. Before that, the container check below is the whole
+          # test and is expected to be; after it, the edge check becomes
+          # mandatory. Which phase applies is decided by looking at the live
+          # Caddyfile rather than by a flag someone has to remember to flip.
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -euo pipefail
+
+            # 1. The origin container itself, by name on the docker network.
+            #    This exercises Apache, PHP and the database, so it is a real
+            #    end-to-end check and not just a liveness ping.
+            status=$(docker run --rm --network opencart-network curlimages/curl:latest \
+              -s -o /dev/null -w "%{http_code}" \
+              --retry 6 --retry-delay 3 --retry-connrefused --max-time 30 \
+              http://fi-wordpress/ || true)
+
+            # WordPress answers / with a 307 to itself carrying a ?v= cache
+            # buster -- that is WooCommerce geolocation with page-caching
+            # support, a store setting, not a fault. Both are healthy.
+            case "$status" in
+              200|301|302|307) echo "Origin container responded HTTP $status." ;;
+              *) echo "Origin container returned HTTP $status, expected 2xx/3xx" >&2; exit 1 ;;
+            esac
+
+            # wp-login.php proves PHP reached the database: it renders a form on
+            # success and a fatal on a failed connection.
+            login=$(docker run --rm --network opencart-network curlimages/curl:latest \
+              -s -o /dev/null -w "%{http_code}" --retry 3 --retry-connrefused --max-time 30 \
+              http://fi-wordpress/wp-login.php || true)
+            if [ "$login" != "200" ]; then
+              echo "wp-login.php returned HTTP $login, expected 200 (database unreachable?)" >&2
+              exit 1
+            fi
+            echo "Origin verified: WordPress is serving and the database is reachable."
+
+            # 2. Through Caddy, once the edge knows this hostname.
+            if ! docker exec opencart-caddy grep -q fantasiaimportada /etc/caddy/Caddyfile 2>/dev/null; then
+              echo "Edge check SKIPPED: the Caddyfile has no fantasiaimportada block yet."
+              echo "That is expected until the edge PR in bellacollezione2 has merged."
+              exit 0
+            fi
+
+            caddy_ip=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" opencart-caddy)
+            if [ -z "$caddy_ip" ]; then
+              echo "Could not determine the Caddy container address" >&2
+              exit 1
+            fi
+            resolve="www.fantasiaimportada.com:443:$caddy_ip"
+
+            edge=$(curl -s -o /dev/null -w "%{http_code}" --resolve "$resolve" \
+              --retry 6 --retry-delay 3 --retry-connrefused --max-time 30 \
+              https://www.fantasiaimportada.com/ || true)
+            case "$edge" in
+              200|301|302|307) ;;
+              *) echo "Edge returned HTTP $edge for the storefront, expected 2xx/3xx" >&2; exit 1 ;;
+            esac
+
+            # The single most likely edge regression for a WordPress tenant is
+            # the site block importing the OpenCart hardening snippet, which
+            # answers 403 to every /wp-* path. Assert the two that would prove
+            # it, because the storefront alone would still look fine.
+            admin=$(curl -s -o /dev/null -w "%{http_code}" --resolve "$resolve" \
+              --retry 3 --retry-connrefused --max-time 30 \
+              https://www.fantasiaimportada.com/wp-login.php || true)
+            if [ "$admin" = "403" ]; then
+              echo "FATAL: /wp-login.php is 403 at the edge -- the site block is importing" >&2
+              echo "edge_hardening instead of edge_hardening_wp. See the bellacollezione2 repo." >&2
+              exit 1
+            fi
+
+            cron=$(curl -s -o /dev/null -w "%{http_code}" --resolve "$resolve" \
+              --retry 3 --retry-connrefused --max-time 30 \
+              https://www.fantasiaimportada.com/wp-cron.php || true)
+            if [ "$cron" = "403" ] || [ "$cron" = "404" ]; then
+              echo "FATAL: /wp-cron.php is $cron at the edge. This site has no system cron," >&2
+              echo "so that silently stops Action Scheduler and every store email." >&2
+              exit 1
+            fi
+
+            echo "Edge verified: storefront, wp-login.php and wp-cron.php all reachable."
+          ' < /dev/null
