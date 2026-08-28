@@ -122,8 +122,30 @@ Ordering matters, and step 5 is the one that can take down the **other two sites
 4. **Seed the webroot and bring the stack up.** Copy the WordPress tree from the old host into
    `/opt/fantasiaimportada/wordpress/` **before the first `up`** — the official image's entrypoint
    installs a fresh WordPress into an empty `/var/www/html`, which would leave a core version that
-   does not match the database. Then write `.env.production`, `sudo chown -R www-data:www-data
-   wordpress`, and:
+   does not match the database.
+
+   **Then make the copied `wp-config.php` environment-aware, or the site 500s.** The old host's file
+   is the pristine production one: `DB_HOST` is hardcoded to `localhost`, which inside a container is
+   the container itself, and the password is the old server's. It needs an `fi_env()` helper and the
+   four DB constants wrapped as `define( 'DB_HOST', fi_env( 'WORDPRESS_DB_HOST', 'localhost' ) )` and
+   so on, keeping the literals as fallbacks. **Do not solve this by copying the repo's
+   `wordpress/wp-config.php` over it** — that file carries *different* salts, and overwriting the
+   live ones invalidates every session and cookie the database was migrated with.
+
+   Two things worth knowing while you are in that file: the production branch already forces
+   `$_SERVER['HTTPS'] = 'on'` for Really Simple Security, so no `X-Forwarded-Proto` handling is
+   needed; and `WORDPRESS_LOCAL_DEV` must stay unset.
+
+   **Also sweep the copied webroot for files that must not be web-servable.** The old host's
+   `/var/www/fantasia` carried `import-opencart/import.env` (containing `OC_DB_PASSWORD`),
+   `import-opencart/bella-catalog.sql` (18 MB) and `tools.tgz`, all of which it served at HTTP 200.
+   They are quarantined outside the webroot here, at
+   `/opt/fantasiaimportada/import-opencart-from-old-host/`:
+   ```sh
+   find wordpress -name '*.sql' -o -name '*.env' -o -name '*.tgz' -o -name '*.bak'
+   ```
+
+   Then write `.env.production`, `sudo chown -R www-data:www-data wordpress`, and:
    ```sh
    docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
    ```

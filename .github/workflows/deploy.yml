@@ -211,8 +211,27 @@ jobs:
             # 1. The origin container itself, by name on the docker network.
             #    This exercises Apache, PHP and the database, so it is a real
             #    end-to-end check and not just a liveness ping.
+            #
+            #    THE HOST HEADER MATTERS. WordPress redirects anything arriving
+            #    under a different hostname to its canonical siteurl, so without
+            #    it every request 301s and the check degrades to "Apache is
+            #    listening". With it, the response is the page WordPress would
+            #    actually serve a visitor. X-Forwarded-Proto mirrors what Caddy
+            #    sends, so the app does not additionally redirect to https.
+            #
+            #    Never follow redirects here without --resolve: the canonical
+            #    URL is the PUBLIC hostname, so a bare `curl -L` would walk off
+            #    this droplet and report on whatever currently serves the
+            #    domain. That reads as a passing deploy of a site this workflow
+            #    never touched.
+            # Double quotes, not single: this whole block is already inside a
+            # single-quoted ssh argument, so an apostrophe here would end it
+            # early. The quotes would still BALANCE, so bash -n reports nothing
+            # wrong -- ssh just receives three arguments instead of one and the
+            # remote shell tries to run `Host:` as a command.
+            H="Host: www.fantasiaimportada.com"
             status=$(docker run --rm --network opencart-network curlimages/curl:latest \
-              -s -o /dev/null -w "%{http_code}" \
+              -s -o /dev/null -w "%{http_code}" -H "$H" -H "X-Forwarded-Proto: https" \
               --retry 6 --retry-delay 3 --retry-connrefused --max-time 30 \
               http://fi-wordpress/ || true)
 
@@ -227,7 +246,8 @@ jobs:
             # wp-login.php proves PHP reached the database: it renders a form on
             # success and a fatal on a failed connection.
             login=$(docker run --rm --network opencart-network curlimages/curl:latest \
-              -s -o /dev/null -w "%{http_code}" --retry 3 --retry-connrefused --max-time 30 \
+              -s -o /dev/null -w "%{http_code}" -H "$H" -H "X-Forwarded-Proto: https" \
+              --retry 3 --retry-connrefused --max-time 30 \
               http://fi-wordpress/wp-login.php || true)
             if [ "$login" != "200" ]; then
               echo "wp-login.php returned HTTP $login, expected 200 (database unreachable?)" >&2
