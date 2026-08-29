@@ -182,10 +182,18 @@ Ordering matters, and step 5 is the one that can take down the **other two sites
 
 ## § 5 Things that are not automated
 
-- **wp-cron runs over HTTP**, because the old host had no crontab entry and none was added. That
-  makes `/wp-cron.php` load-bearing at the edge; the bellacollezione2 repo's
-  `tools/caddy-edge-check.sh` pins it. If a system cron is ever added, set `DISABLE_WP_CRON` at the
-  same time.
+- **Cron now comes from the system scheduler**, not from page views. `tools/wp-cron.sh` runs every
+  5 minutes from root's crontab and `WORDPRESS_DISABLE_WP_CRON=1` is set in `.env.production`.
+  **They are a pair**: unset the variable and both mechanisms run; remove the crontab entry and
+  scheduled work stops silently -- Action Scheduler stalls and the store sends no email, with nothing
+  logged anywhere.
+
+  This replaced traffic-driven spawning, which cost 70 self-requests per hour (7.2% of all traffic)
+  on 2026-08-29, almost entirely from crawlers rather than from real work being due.
+
+  `/wp-cron.php` is still allowed at the edge and pinned by the bellacollezione2 repo's
+  `tools/caddy-edge-check.sh`. That is deliberate: blocking it now would be safe, but the allowance
+  costs nothing and keeps a manual trigger available.
 - **Plugin and core updates** happen through the WordPress admin and are not captured in git.
 - **Backups** need no action here: `tools/backup-databases.sh` on the droplet discovers every
   non-system database rather than listing them, so `fantasia_wpdb` is picked up automatically.
