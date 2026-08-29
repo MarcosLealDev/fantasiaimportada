@@ -94,6 +94,13 @@ services:
       # being a file that only exists on one server.
       - ./tools/import-opencart/01-opencart-images.php:/var/www/html/wp-content/mu-plugins/01-opencart-images.php:ro
 
+      # Refuses every feed endpoint. WordPress generates one per product,
+      # category and tag -- about 7,000 extra crawlable URLs on this catalog,
+      # each a full PHP render, and nothing on the site consumes them. Mounted
+      # rather than copied so it is tracked, reviewable, and removable by
+      # deleting this line.
+      - ./docker/mu-plugins/10-disable-feeds.php:/var/www/html/wp-content/mu-plugins/10-disable-feeds.php:ro
+
       - ./docker/php-prod.ini:/usr/local/etc/php/conf.d/zzz-prod.ini:ro
 
     # Deliberately does NOT touch the database. A healthcheck that needs MariaDB
