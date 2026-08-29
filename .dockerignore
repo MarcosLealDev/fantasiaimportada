@@ -1,6 +1,11 @@
-# No service in docker-compose.yml currently builds a custom image (all use
-# prebuilt mariadb / wordpress images), so this has no effect yet. Kept ready
-# for if a Dockerfile is added later, mirroring .gitignore's exclusions.
+# THIS FILE NO LONGER APPLIES TO THE PRODUCTION BUILD. docker-compose.prod.yml
+# builds with `context: ./docker/apache`, so the build context is that directory
+# alone -- a few KB of Dockerfile and Apache conf, with no application code, no
+# dumps and no secrets in it at all. Docker reads .dockerignore from the CONTEXT
+# root, not the project root, so nothing below is consulted for that build.
+#
+# It is kept because the exclusions still describe what must never enter an image
+# built from the project root, should one ever be added.
 
 .git/
 .gitignore

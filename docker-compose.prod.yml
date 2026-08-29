@@ -1,0 +1,140 @@
+name: fantasiaimportada-prod
+
+# Production stack for fantasiaimportada.com. Run from the deploy directory on
+# the droplet:
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
+#
+# This site is a TENANT on the bellacollezione droplet, not a self-contained
+# stack. It brings ONE container and nothing else:
+#
+#   - No db service. MariaDB is owned by /opt/bellacollezione and reached by
+#     service name over the shared network below. Isolation is by database and
+#     user: fantasia_wpdb, owned by a `fantasia` user with no grant on any other
+#     schema.
+#   - No redis service, and no Redis use at all. WordPress needs an
+#     object-cache.php drop-in to touch Redis and has none. If one is ever
+#     installed it needs its own WP_REDIS_PREFIX and WP_REDIS_DATABASE, because
+#     the neighbouring stores share that server (oc_ on db 0, frz_ on db 1).
+#   - No caddy service. TLS, the apex -> www redirect and all edge hardening
+#     live in the bellacollezione2 repo's docker/caddy/Caddyfile, the only thing
+#     bound to ports 80/443 on this host. Edge changes for this domain are PRs
+#     against THAT repo -- including the (edge_hardening_wp) snippet this site
+#     depends on, which exists because the OpenCart one 403s every /wp-* path.
+#   - Nothing publishes a host port. Caddy reaches this container by name over
+#     the docker network; the origin is otherwise unreachable.
+
+# THE SERVICE NAME IS LOAD-BEARING, not cosmetic. Compose publishes each
+# service's NAME as a network alias; container_name does NOT. All three stacks
+# sit on one network, so a service here called `wordpress`, `apache` or `php`
+# could collide with a neighbour's and make that name resolve to TWO containers,
+# which Docker then round-robins between. That is not hypothetical: it took the
+# live bellacollezione store to 404s within seconds the first time the frizza
+# stack came up with stock service names, with nothing reporting an error.
+#
+# Hence `fi-wordpress`. The deploy asserts no shared alias resolves to more than
+# one address before reporting success. Note the local docker-compose.yml still
+# uses `wordpress` and `db`; that is fine because it never runs on this host, and
+# it is the reason this file exists separately rather than as an override.
+services:
+  fi-wordpress:
+    container_name: fi-wordpress
+    build:
+      context: ./docker/apache
+      dockerfile: Dockerfile
+    restart: unless-stopped
+
+    # DB credentials and the host override arrive as process environment, which
+    # wp-config.php reads through its fi_env() helper. DB_HOST is the one that
+    # MUST be set: the file falls back to the live host's `localhost`, which
+    # inside this container is the container itself.
+    env_file: .env.production
+
+    # A HARD CEILING IS REQUIRED HERE, and it is about the neighbours rather
+    # than about this site. The droplet is 1 vCPU / 2 GB with ~1.1 GB free, and
+    # the kernel OOM killer picks by badness score, not by who is at fault -- an
+    # unbounded WooCommerce container would most likely take the SHARED MariaDB
+    # with it and turn one site's memory bug into a three-site outage. With this
+    # limit the cgroup kills only this container, and the other two stores stay
+    # up.
+    #
+    # The arithmetic: opcache is one 96 MB shared segment, plus five Apache
+    # workers at a worst-observed ~90 MB each, is ~546 MB. PHP's own
+    # memory_limit (256M, in docker/php-prod.ini) is deliberately BELOW what a
+    # single runaway request would need to breach this, so such a request dies
+    # with a visible PHP fatal in the log instead of the cgroup killing Apache
+    # silently.
+    #
+    # If the droplet starts struggling, lower MaxRequestWorkers in
+    # docker/apache/conf/zz-mpm.conf FIRST -- it is the term that scales.
+    mem_limit: 640m
+
+    volumes:
+      # The webroot. WordPress core, wp-content and wp-config.php are all
+      # droplet-owned state seeded once from the old host, NOT shipped by the
+      # deploy -- only wordpress/.htaccess is tracked in git. See DEPLOYMENT.md.
+      - ./wordpress:/var/www/html
+
+      # OpenCart product images are LINKED, NEVER COPIED. The catalog tree is
+      # 2.1 GB / 19,230 files belonging to the neighbouring store, and the
+      # importer wrote _wp_attached_file values of the form `oc-catalog/...`
+      # that resolve straight through this mount.
+      #
+      # READ-ONLY IS NOT OPTIONAL. WordPress writes resized copies next to the
+      # original, which would mean this site writing into bellacollezione's live
+      # image store. wp-content/mu-plugins/01-opencart-images.php exists to
+      # prevent exactly that: it intercepts image_downsize and redirects every
+      # size request to OpenCart's own cache first, then to the writable
+      # oc-thumbs/ directory, which lives in this site's own uploads.
+      - /opt/bellacollezione/upload/image/catalog:/var/www/html/wp-content/uploads/oc-catalog:ro
+      - /opt/bellacollezione/upload/image/cache/catalog:/var/www/html/wp-content/uploads/oc-cache:ro
+
+      # Mounted from tools/ rather than left as a copy in wp-content, so the
+      # image-resolution logic is tracked, reviewable and deployed rather than
+      # being a file that only exists on one server.
+      - ./tools/import-opencart/01-opencart-images.php:/var/www/html/wp-content/mu-plugins/01-opencart-images.php:ro
+
+      - ./docker/php-prod.ini:/usr/local/etc/php/conf.d/zzz-prod.ini:ro
+
+    # Deliberately does NOT touch the database. A healthcheck that needs MariaDB
+    # would report this container unhealthy during someone else's maintenance,
+    # and restart-loop it for a fault it cannot fix. Proving Apache accepts
+    # connections is this container's own business; the deploy's verify step
+    # does the real end-to-end check through PHP and the database.
+    healthcheck:
+      test: ['CMD-SHELL', 'php -r ''exit(@fsockopen("127.0.0.1", 80) ? 0 : 1);''']
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    # Internal only -- reachable from Caddy over the docker network, never from
+    # the host or the internet.
+    expose:
+      - '80'
+
+    # json-file has no cap by default and a deploy recreates the container
+    # (which empties a fresh log anyway), so without this it grows unbounded
+    # between deploys.
+    logging:
+      driver: json-file
+      options:
+        max-size: '25m'
+        max-file: '5'
+
+    networks:
+      - opencart
+
+networks:
+  # Created and owned by the bellacollezione stack. Joining it as external is
+  # what gives this site DNS resolution for `mysql`, and what puts it on the
+  # same 172.x bridge that both Caddy's upstream name and the Apache
+  # RemoteIPInternalProxy range depend on.
+  #
+  # If this fails with "network not found", the bella stack is down and this
+  # site cannot start either. That coupling is intentional and visible; the
+  # deploy checks for the network explicitly so it fails loudly rather than
+  # silently creating an empty one that resolves nothing.
+  opencart:
+    external: true
+    name: opencart-network

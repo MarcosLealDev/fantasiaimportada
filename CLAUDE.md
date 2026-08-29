@@ -4,13 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A **local Docker development copy** of the live WordPress 7.1 + WooCommerce 11
-store at `https://www.fantasiaimportada.com` (Blocksy theme, Portuguese/BRL,
-Stripe + PagSeguro gateways). It also carries tooling that imports a second
-store's catalog — Bella Collezione, an OpenCart install — into this one.
+The infrastructure for the WordPress 7.1 + WooCommerce 11 store at
+`https://www.fantasiaimportada.com` (Blocksy theme, Portuguese/BRL, Stripe +
+PagSeguro gateways), plus a **local Docker development copy** of it and tooling
+that imports a second store's catalog — Bella Collezione, an OpenCart install —
+into it.
 
-Nothing here deploys. The live site is untouched by anything in this repo unless
-you explicitly run the import tooling against it.
+**THIS REPO NOW DEPLOYS.** `docker-compose.prod.yml` and
+`.github/workflows/deploy.yml` run the live site as a tenant container on the
+bellacollezione droplet, and **merging to `main` deploys immediately**. Read
+`DEPLOYMENT.md` before changing anything under `docker/apache/`,
+`docker-compose.prod.yml` or `.github/`. The local stack
+(`docker-compose.yml`) is unchanged and still touches nothing remote.
+
+Note that the deploy ships **infrastructure, not WordPress**: exactly one file
+under `wordpress/` is tracked in git (`.htaccess`). Core, plugins, themes and
+uploads are droplet-owned state seeded once from the old host.
 
 ## Layout
 
@@ -19,12 +28,15 @@ Only infrastructure lives at the root; `wordpress/` is the webroot mounted at
 deliberate — they must not be web-servable.
 
 ```
-docker-compose.yml
-docker/                  php-local.ini, mu-plugins/00-local-dev.php
+docker-compose.yml       local development stack
+docker-compose.prod.yml  the live tenant container (one service, fi-wordpress)
+docker/                  php-local.ini, php-prod.ini, apache/ (prod image),
+                         mu-plugins/00-local-dev.php
 db-backup/               fantasia_wpdb.sql -> MariaDB initdb (see warning below)
 tools/import-opencart/   the OpenCart -> WooCommerce importer
 wordpress/               webroot (WordPress core, wp-content, wp-config.php)
 wp-config.php.prod.bak   pristine production config, kept out of the webroot
+DEPLOYMENT.md            production topology, deploy flow, first-time setup
 ```
 
 ## Commands
@@ -78,6 +90,32 @@ live site. Don't "fix" this without asking.
   elsewhere (`tools/import-opencart/` holds the OpenCart one).
 - `docker compose down -v` drops the database volume and replays the initdb
   import — that discards the imported catalog too.
+- **Production is a shared droplet, and the failure modes are neighbourly.** The
+  service name `fi-wordpress` is load-bearing (a name shared with another stack
+  resolves to two containers and Docker round-robins between them, cross-wiring
+  two live sites silently), the container's `mem_limit` exists so an OOM kills
+  this site rather than the shared MariaDB, and the `oc-catalog` / `oc-cache`
+  mounts must stay `:ro` because they are the neighbouring store's real image
+  tree. The deploy asserts all three. See `DEPLOYMENT.md`.
+
+## Production PHP is 8.3; the old host ran 8.1
+
+`docker/apache/Dockerfile` pins `wordpress:php8.3-apache`, matching the local
+stack. The image supplies **only** Apache and PHP — the webroot bind mount masks
+its copy of WordPress — so that tag is a PHP version choice, not a WordPress
+one. Rolling back is this file plus `docker-compose.yml`.
+
+Two Apache details are deliberate and easy to undo by accident:
+
+- **`RemoteIPHeader X-Real-IP`, and the stock `remoteip.conf` is disabled.**
+  Enabling `mod_remoteip` also enables a Debian conf that sets
+  `X-Forwarded-For` and trusts four extra private ranges; `RemoteIPInternalProxy`
+  is additive, so those ranges would survive our override and the trust list
+  would be stated in two places that disagree. `a2disconf remoteip` in the
+  Dockerfile is what stops that.
+- **`MaxRequestWorkers 5`**, down from the stock 150. With mod_php every worker
+  holds a PHP interpreter, and 150 of them on a shared 2 GB droplet exhausts
+  memory long before the single vCPU saturates.
 
 ## The OpenCart import (`tools/import-opencart/`)
 
