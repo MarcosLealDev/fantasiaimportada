@@ -164,8 +164,24 @@ jobs:
             #
             # Checked from inside Caddy, which is the resolver that actually
             # matters, and after `up` so it sees the real running state.
+            #
+            # `wordpress` is in this list because it must resolve to NOTHING --
+            # it is the service name the local compose file uses, and the whole
+            # point of renaming it here is that it never appears on the shared
+            # network. Zero is the healthy answer for it, and one or more means
+            # someone brought the dev stack up on this host.
+            #
+            # HENCE THE `|| true`, which is load-bearing rather than sloppy.
+            # getent exits 2 when a name does not resolve, and this block runs
+            # under `set -o pipefail`, so without it the pipeline fails and
+            # `set -e` aborts the deploy -- treating the BEST possible outcome
+            # as a fatal error. That is exactly what happened on the first
+            # merged deploy: everything succeeded, the container came up
+            # healthy, and the run then died with exit 2 on the one name that
+            # was behaving correctly. wc -l has already printed 0 by then, so
+            # the count stays accurate.
             for name in apache php frizza-apache frizza-php fi-wordpress wordpress; do
-              n=$(docker exec opencart-caddy getent hosts "$name" 2>/dev/null | wc -l)
+              n=$(docker exec opencart-caddy getent hosts "$name" 2>/dev/null | wc -l || true)
               if [ "$n" -gt 1 ]; then
                 echo "FATAL: \"$name\" resolves to $n containers on opencart-network." >&2
                 echo "The stacks are now cross-wired. Check service names in docker-compose.prod.yml." >&2
@@ -256,8 +272,17 @@ jobs:
             echo "Origin verified: WordPress is serving and the database is reachable."
 
             # 2. Through Caddy, once the edge knows this hostname.
-            if ! docker exec opencart-caddy grep -q fantasiaimportada /etc/caddy/Caddyfile 2>/dev/null; then
-              echo "Edge check SKIPPED: the Caddyfile has no fantasiaimportada block yet."
+            #
+            # ANCHORED TO A SITE-BLOCK OPENING, not a bare substring. Matching
+            # "fantasiaimportada" anywhere finds the COMMENTS -- the Caddyfile
+            # explains the WordPress snippet, and carries a block recording that
+            # this domain is deliberately not served yet. So the bare grep found
+            # its own documentation, decided the edge was live, and failed the
+            # deploy with 000 against a hostname Caddy does not serve. Site
+            # addresses start at column 0 and comments start with #, so the
+            # anchor separates them cleanly.
+            if ! docker exec opencart-caddy grep -qE "^www\.fantasiaimportada\.com" /etc/caddy/Caddyfile 2>/dev/null; then
+              echo "Edge check SKIPPED: the Caddyfile has no www.fantasiaimportada.com site block yet."
               echo "That is expected until the edge PR in bellacollezione2 has merged."
               exit 0
             fi
