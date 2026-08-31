@@ -130,9 +130,27 @@ resolve natively (`_wp_attached_file = oc-catalog/...`) with no URL rewriting.
 On a real server the same effect comes from a symlink. WordPress normally writes
 resized copies next to the original, which would mean writing into that store —
 so `01-opencart-images.php` hooks `image_downsize` and redirects every size
-request: OpenCart's own cache first (`oc-cache`, covers <5%), then a previously
-rendered file, then renders it once into the writable `oc-thumbs/`. That folder
-is disposable and regenerates on demand. **The image store must stay read-only.**
+request: OpenCart's own cache first (`oc-cache`), then a previously rendered
+file, then renders it once into the writable `oc-thumbs/`. That folder is
+disposable and regenerates on demand. **The image store must stay read-only.**
+
+Two things about that lookup are worth knowing before touching it, both
+measured on the live tree rather than assumed:
+
+- **`oc-cache` satisfies ~85% of size requests, not "<5%" as this file used to
+  claim.** It is the hot path, so its cost is the plugin's cost. It is looked up
+  with a bounded run of `is_readable()` probes against known rendition widths,
+  *never* with `glob()`: the cache is one flat directory per category and
+  `products/masculino` alone holds 70,666 files, so a single `glob()` cost
+  ~80 ms and grew with the neighbouring store's catalog. Unmemoised, that was
+  89 s to render one product page and a 120 s fatal on the largest galleries.
+- **Every rendition the plugin resolves is square and letterboxed on white,
+  matching OpenCart's own output** (verified: 10/10 sample renders match
+  OpenCart's content geometry within 4%). Blocksy gives product media a 1:1
+  container defaulting to `object-fit: cover`, so anything non-square gets
+  cropped — which is what was cutting the tops off tall product photos. Content
+  is scaled to *fill* the box, enlarging small sources, because OpenCart does
+  the same; do not "fix" that into a no-upscale fit.
 
 **Phases are idempotent and resumable.** Records match on OpenCart ids kept in
 meta (`_oc_product_id`, `_oc_category_id`, `_oc_manufacturer_id`,
