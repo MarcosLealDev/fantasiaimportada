@@ -69,6 +69,30 @@ services:
     # docker/apache/conf/zz-mpm.conf FIRST -- it is the term that scales.
     mem_limit: 640m
 
+    # THE CPU CEILING IS THE SAME ARGUMENT AS mem_limit, for the other finite
+    # resource. The droplet has exactly ONE vCPU shared by three stores, and
+    # until this was set nothing stopped this container from taking all of it.
+    # That is not hypothetical either: on 2026-08-31 three of the five Apache
+    # workers sat at 100% for hours -- 21, 12 and 8 minutes of accumulated CPU
+    # apiece -- because the image resolver was globbing a 435,480-file directory
+    # per image per size. The storefront next door stayed up, but it was
+    # competing for the same core the whole time, and `docker stats` showed this
+    # container at 0.00% because the load is bursty. `ps` accumulated time is
+    # what exposed it.
+    #
+    # 0.5 is a hard ceiling: even a pathological request loop can never take
+    # more than half the core, which leaves the other half for MariaDB, Redis,
+    # Caddy and the two OpenCart stores. cpu_shares then decides what happens
+    # BELOW that ceiling -- it only bites under contention, so this container
+    # still bursts into idle capacity, but yields to the default-weight (1024)
+    # neighbours when everyone wants the CPU at once.
+    #
+    # If this proves too tight for normal traffic, raise `cpus` before touching
+    # cpu_shares; the ceiling is the blunt instrument, the shares are the
+    # neighbourly part.
+    cpus: 0.5
+    cpu_shares: 512
+
     volumes:
       # The webroot. WordPress core, wp-content and wp-config.php are all
       # droplet-owned state seeded once from the old host, NOT shipped by the
