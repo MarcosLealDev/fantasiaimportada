@@ -354,6 +354,51 @@ add_filter(
 	3
 );
 
+/**
+ * Stop WooCommerce regenerating thumbnails for these attachments on every request.
+ *
+ * WC_Regenerate_Images::maybe_resize_image() hooks wp_get_attachment_image_src()
+ * and, for woocommerce_thumbnail / woocommerce_single / woocommerce_gallery_thumbnail,
+ * checks the returned rendition against the *original file's* aspect ratio with
+ * wp_image_matches_ratio(). Every rendition here is a letterboxed square, so for
+ * a catalog that is mostly portrait that check can never pass -- and the resize
+ * it then attempts writes next to the original, which lives in the neighbouring
+ * store's read-only mount. So it did the full image-editor work, failed to save,
+ * cached nothing, and did it again on the next request. Forever.
+ *
+ * Measured on the live site before this: 0.9-4.4 s per attachment, and 25.4 s
+ * for one variable product's four variations, which drops to 0.09 s with this
+ * in place. It was the dominant cost of every single-product page.
+ *
+ * Scoped to OpenCart-linked attachments by wrapping rather than disabling, so a
+ * normal WooCommerce upload -- one this plugin does not manage, in a writable
+ * directory -- keeps stock behaviour. Runs at priority 20 because WooCommerce
+ * registers the filter from its own `init` callback at the default 10.
+ */
+add_action(
+	'init',
+	static function () {
+		if ( ! class_exists( 'WC_Regenerate_Images' ) ) {
+			return;
+		}
+
+		remove_filter( 'wp_get_attachment_image_src', array( 'WC_Regenerate_Images', 'maybe_resize_image' ), 10 );
+
+		add_filter(
+			'wp_get_attachment_image_src',
+			static function ( $image, $attachment_id, $size, $icon ) {
+				if ( '' !== oc_img_rel_path( (int) $attachment_id ) ) {
+					return $image;
+				}
+				return WC_Regenerate_Images::maybe_resize_image( $image, $attachment_id, $size, $icon );
+			},
+			10,
+			4
+		);
+	},
+	20
+);
+
 // Metadata for these attachments has an empty `sizes` list, so core would build
 // srcset entries that do not exist. Suppress it rather than serve 404s.
 add_filter(
