@@ -203,6 +203,58 @@ jobs:
             done
             echo "Image-store mounts verified read-only."
 
+            # THE BIND-MOUNT INODE TRAP, WHICH MAKES A GREEN DEPLOY A NO-OP.
+            # `up -d --build` recreates the container only when the compose
+            # config or the image changes. rsync writes a NEW inode for every
+            # file it updates, and Docker bound the OLD inode when the container
+            # started -- so a deploy touching only a bind-mounted FILE lands
+            # correctly on the droplet and changes nothing in the running
+            # container. Everything reports success while the old code executes.
+            #
+            # Not theoretical: on 2026-08-31 PR #12 and PR #14 both deployed
+            # this way, each a change to 01-opencart-images.php alone. PR #13
+            # took effect only because it happened to edit
+            # docker-compose.prod.yml and so forced a recreate, silently
+            # activating #12 as a side effect. Two of three deploys that day
+            # were green and inert.
+            #
+            # Compare CONTENT inside the container against the droplet, because
+            # the whole failure mode is that the paths agree and the bytes do
+            # not. The list is derived from the container rather than written
+            # out here, so a mount added later is covered without touching this
+            # block. Directory mounts are skipped: they resolve per lookup and
+            # cannot go stale this way.
+            docker inspect fi-wordpress \
+              --format "{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}|{{.Destination}}{{println}}{{end}}{{end}}" \
+              > /tmp/fi-bind-mounts.txt
+
+            stale=0
+            while IFS="|" read -r src dst; do
+              [ -n "$src" ] || continue
+              [ -f "$src" ] || continue
+
+              host_sum=$(sudo md5sum "$src" | cut -d" " -f1)
+              cont_sum=$(docker exec fi-wordpress md5sum "$dst" 2>/dev/null | cut -d" " -f1 || true)
+
+              if [ -z "$cont_sum" ]; then
+                echo "FATAL: $dst is not readable inside the container." >&2
+                stale=1
+              elif [ "$host_sum" != "$cont_sum" ]; then
+                echo "FATAL: $dst is STALE inside the container." >&2
+                echo "  droplet:   $host_sum  ($src)" >&2
+                echo "  container: $cont_sum" >&2
+                stale=1
+              fi
+            done < /tmp/fi-bind-mounts.txt
+            rm -f /tmp/fi-bind-mounts.txt
+
+            if [ "$stale" -ne 0 ]; then
+              echo "The container is running an older copy of a bind-mounted file, so this deploy changed nothing." >&2
+              echo "Fix: docker compose -f docker-compose.prod.yml --env-file .env.production up -d --force-recreate" >&2
+              exit 1
+            fi
+            echo "Bind-mounted files verified fresh inside the container."
+
             echo "___DEPLOY_STEPS_COMPLETE___"
           ' < /dev/null
 
