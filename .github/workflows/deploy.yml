@@ -153,6 +153,10 @@ jobs:
             # resolves neither mysql nor anything else.
             docker network inspect opencart-network >/dev/null
 
+            # Pull the newest wordpress:php8.3-apache base first. up --build alone
+            # reuses the cached base, so PHP security releases never land: prod
+            # sat on PHP 8.3.33 after 8.3.36 shipped.
+            docker compose -f docker-compose.prod.yml --env-file .env.production build --pull fi-wordpress < /dev/null
             docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build < /dev/null
 
             # Guard against the service-name collision that took bellacollezione
