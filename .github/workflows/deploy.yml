@@ -153,10 +153,15 @@ jobs:
             # resolves neither mysql nor anything else.
             docker network inspect opencart-network >/dev/null
 
-            # Pull the newest wordpress:php8.3-apache base first. up --build alone
-            # reuses the cached base, so PHP security releases never land: prod
-            # sat on PHP 8.3.33 after 8.3.36 shipped.
-            docker compose -f docker-compose.prod.yml --env-file .env.production build --pull fi-wordpress < /dev/null
+            # NO --pull, on purpose. up --build builds FROM the wordpress:php8.3-apache
+            # tag stored on the droplet, so a deploy never picks up a new base by
+            # surprise (a pull here meant any merge could rebuild and restart
+            # WordPress on a new PHP). Updating the base is a deliberate step,
+            # done on the droplet when you choose:
+            #   docker pull wordpress:php8.3-apache, then re-run this deploy.
+            # BuildKit prefers a locally stored base tag, so do not delete it, or
+            # every deploy floats on the newest base again. Same rule as the
+            # bellacollezione and frizzadesigns deploys.
             docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build < /dev/null
 
             # Guard against the service-name collision that took bellacollezione
